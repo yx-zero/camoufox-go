@@ -1,0 +1,25 @@
+# Cloned upstream references for porting (not part of the build)
+/reference/
+
+# Downloaded Camoufox browser binaries / cache
+/cache/
+*.zip
+*.tar.xz
+*.tar.bz2
+
+# Build output
+/bin/
+*.exe
+camoufox
+!cmd/camoufox/
+camoufox-bin
+
+# Screenshots / scratch
+*.png
+/tmp/
+/scratch/
+
+# Go
+*.test
+*.out
+coverage.*
