@@ -44,6 +44,10 @@ type Options struct {
 	Locale string
 	// WebRTCIP, when set, spoofs the WebRTC public IPv4 (webrtc:ipv4).
 	WebRTCIP string
+	// ScreenMaxWidth/ScreenMaxHeight, when > 0, constrain preset selection to
+	// presets whose screen fits within the given bounds.
+	ScreenMaxWidth  int
+	ScreenMaxHeight int
 	// Overrides are applied last, replacing any generated config keys. Use this
 	// for advanced manual property control.
 	Overrides config.Map
@@ -61,7 +65,7 @@ func Generate(opts Options) (config.Map, error) {
 	}
 	rng := rand.New(rand.NewSource(seed)) //nolint:gosec // fingerprint variety, not crypto
 
-	preset, err := getRandomPreset(opts.OS, opts.FFVersion, rng)
+	preset, err := getRandomPreset(opts.OS, opts.FFVersion, opts.ScreenMaxWidth, opts.ScreenMaxHeight, rng)
 	if err != nil {
 		return nil, err
 	}
@@ -302,8 +306,10 @@ var osToPresetKey = map[string]string{
 }
 
 // getRandomPreset picks a random preset for the requested OS (or any OS when
-// empty), porting get_random_preset().
-func getRandomPreset(os string, ffVersion int, rng *rand.Rand) (*Preset, error) {
+// empty), porting get_random_preset(). When maxW/maxH are > 0, only presets
+// whose screen fits within those bounds are considered (falling back to the full
+// candidate set if none fit).
+func getRandomPreset(os string, ffVersion, maxW, maxH int, rng *rand.Rand) (*Preset, error) {
 	bundle, err := loadBundle(ffVersion)
 	if err != nil {
 		return nil, err
@@ -324,6 +330,17 @@ func getRandomPreset(os string, ffVersion int, rng *rand.Rand) (*Preset, error) 
 	}
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("fingerprint: no presets available for os=%q", os)
+	}
+	if maxW > 0 || maxH > 0 {
+		var fit []*Preset
+		for _, p := range candidates {
+			if (maxW <= 0 || p.Screen.Width <= maxW) && (maxH <= 0 || p.Screen.Height <= maxH) {
+				fit = append(fit, p)
+			}
+		}
+		if len(fit) > 0 {
+			candidates = fit
+		}
 	}
 	return candidates[rng.Intn(len(candidates))], nil
 }

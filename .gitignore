@@ -19,6 +19,12 @@ camoufox-bin
 /tmp/
 /scratch/
 
+# Scratch test harnesses (contain ad-hoc proxy/target URLs — never commit)
+/cmd/cftest/
+/cmd/s2test/
+/cmd/feattest/
+/cmd/cfdebug/
+
 # Go
 *.test
 *.out

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/yx-zero/camoufox-go/juggler"
 )
@@ -21,7 +22,7 @@ type Page struct {
 
 	mu          sync.Mutex
 	mainFrameID string
-	execCtx     string // latest main-world execution context id
+	execCtx     string // latest main-world execution context id (main frame)
 	url         string
 	closed      bool
 
@@ -29,6 +30,44 @@ type Page struct {
 	readyOnce sync.Once
 
 	navWaiters []*navWaiter
+
+	// frame tree: frameID -> frame info, and frameID -> its main-world context.
+	frames   map[string]*frameInfo
+	frameCtx map[string]string
+
+	// lifecycle flags for the main frame, reset on each main-frame commit.
+	domContentLoaded bool
+	loadFired        bool
+
+	// network tracking (for WaitForLoadState networkidle + the nav Response).
+	inflight     map[string]bool
+	lastNetwork  time.Time
+	mainNavID    string    // navigationId of the current main-frame navigation
+	mainNavReqID string    // requestId of that navigation's document request
+	lastResponse *Response // most recent main-frame document response
+
+	// init scripts accumulated via AddInitScript (Page.setInitScripts replaces).
+	initScripts []string
+
+	// network interception routes + whether interception is enabled.
+	routes          []*routeEntry
+	interceptEnabled bool
+
+	// dialogHandler handles JS dialogs; nil auto-dismisses.
+	dialogHandler func(*Dialog)
+
+	// event handlers (nil = ignored).
+	consoleHandler   func(ConsoleMessage)
+	pageErrorHandler func(string)
+	popupHandler     func(*Page)
+}
+
+// frameInfo is a node in the page's frame tree.
+type frameInfo struct {
+	id       string
+	parentID string
+	url      string
+	name     string
 }
 
 // navWaiter tracks a pending navigation's load lifecycle. A waiter is only
@@ -41,12 +80,16 @@ type navWaiter struct {
 
 func newPage(b *Browser, sessionID, targetID, contextID string) *Page {
 	return &Page{
-		browser:   b,
-		client:    b.client,
-		sessionID: sessionID,
-		targetID:  targetID,
-		contextID: contextID,
-		readyCh:   make(chan struct{}),
+		browser:     b,
+		client:      b.client,
+		sessionID:   sessionID,
+		targetID:    targetID,
+		contextID:   contextID,
+		readyCh:     make(chan struct{}),
+		frames:      make(map[string]*frameInfo),
+		frameCtx:    make(map[string]string),
+		inflight:    make(map[string]bool),
+		lastNetwork: time.Now(),
 	}
 }
 
@@ -79,8 +122,11 @@ func (p *Page) onExecCtxCreated(params json.RawMessage) {
 	}
 	// The main world's context has an empty world name; isolated/utility worlds
 	// are named. Evaluate runs in the main world so the page sees real globals.
-	if ev.AuxData.Name == "" && ev.AuxData.FrameID == p.mainFrameID {
-		p.execCtx = ev.ExecutionContextID
+	if ev.AuxData.Name == "" && ev.AuxData.FrameID != "" {
+		p.frameCtx[ev.AuxData.FrameID] = ev.ExecutionContextID
+		if ev.AuxData.FrameID == p.mainFrameID {
+			p.execCtx = ev.ExecutionContextID
+		}
 	}
 	ready := p.mainFrameID != "" && p.execCtx != ""
 	p.mu.Unlock()
@@ -97,11 +143,9 @@ func (p *Page) onFrameAttached(params json.RawMessage) {
 	if err := json.Unmarshal(params, &ev); err != nil {
 		return
 	}
-	if ev.ParentFrameID != "" {
-		return // sub-frame
-	}
 	p.mu.Lock()
-	if p.mainFrameID == "" {
+	p.frames[ev.FrameID] = &frameInfo{id: ev.FrameID, parentID: ev.ParentFrameID}
+	if ev.ParentFrameID == "" && p.mainFrameID == "" {
 		p.mainFrameID = ev.FrameID
 	}
 	ready := p.mainFrameID != "" && p.execCtx != ""
@@ -111,20 +155,60 @@ func (p *Page) onFrameAttached(params json.RawMessage) {
 	}
 }
 
+func (p *Page) onFrameDetached(params json.RawMessage) {
+	var ev struct {
+		FrameID string `json:"frameId"`
+	}
+	if err := json.Unmarshal(params, &ev); err != nil {
+		return
+	}
+	p.mu.Lock()
+	delete(p.frames, ev.FrameID)
+	delete(p.frameCtx, ev.FrameID)
+	p.mu.Unlock()
+}
+
 func (p *Page) onNavigationCommitted(params json.RawMessage) {
 	var ev struct {
 		FrameID string `json:"frameId"`
 		URL     string `json:"url"`
+		Name    string `json:"name"`
+	}
+	if err := json.Unmarshal(params, &ev); err != nil {
+		return
+	}
+	p.mu.Lock()
+	if fi := p.frames[ev.FrameID]; fi != nil {
+		fi.url = ev.URL
+		fi.name = ev.Name
+	} else {
+		p.frames[ev.FrameID] = &frameInfo{id: ev.FrameID, url: ev.URL, name: ev.Name}
+	}
+	if ev.FrameID == p.mainFrameID {
+		p.url = ev.URL
+		// A new main-document committed: reset lifecycle flags.
+		p.domContentLoaded = false
+		p.loadFired = false
+		for _, w := range p.navWaiters {
+			w.committed = true
+		}
+	}
+	p.mu.Unlock()
+}
+
+func (p *Page) onNavigationStarted(params json.RawMessage) {
+	var ev struct {
+		FrameID      string `json:"frameId"`
+		NavigationID string `json:"navigationId"`
 	}
 	if err := json.Unmarshal(params, &ev); err != nil {
 		return
 	}
 	p.mu.Lock()
 	if ev.FrameID == p.mainFrameID {
-		p.url = ev.URL
-		for _, w := range p.navWaiters {
-			w.committed = true
-		}
+		p.mainNavID = ev.NavigationID
+		p.mainNavReqID = ""
+		p.lastResponse = nil
 	}
 	p.mu.Unlock()
 }
@@ -137,21 +221,106 @@ func (p *Page) onEventFired(params json.RawMessage) {
 	if err := json.Unmarshal(params, &ev); err != nil {
 		return
 	}
-	if ev.Name != "load" {
+	p.mu.Lock()
+	if ev.FrameID == p.mainFrameID {
+		switch ev.Name {
+		case "DOMContentLoaded":
+			p.domContentLoaded = true
+		case "load":
+			p.loadFired = true
+			kept := p.navWaiters[:0]
+			for _, w := range p.navWaiters {
+				if w.committed {
+					w.ch <- nil
+				} else {
+					kept = append(kept, w)
+				}
+			}
+			p.navWaiters = kept
+		}
+	}
+	p.mu.Unlock()
+}
+
+// ----- network event handlers (for networkidle + the nav Response) -----
+
+func (p *Page) onRequestWillBeSent(params json.RawMessage) {
+	var ev struct {
+		FrameID       string     `json:"frameId"`
+		RequestID     string     `json:"requestId"`
+		NavigationID  string     `json:"navigationId"`
+		URL           string     `json:"url"`
+		Method        string     `json:"method"`
+		Headers       []headerKV `json:"headers"`
+		IsIntercepted bool       `json:"isIntercepted"`
+	}
+	if err := json.Unmarshal(params, &ev); err != nil {
 		return
 	}
 	p.mu.Lock()
-	if ev.FrameID == p.mainFrameID {
-		kept := p.navWaiters[:0]
-		for _, w := range p.navWaiters {
-			if w.committed {
-				w.ch <- nil
-			} else {
-				kept = append(kept, w)
-			}
-		}
-		p.navWaiters = kept
+	p.inflight[ev.RequestID] = true
+	p.lastNetwork = time.Now()
+	if ev.NavigationID != "" && ev.NavigationID == p.mainNavID && p.mainNavReqID == "" {
+		p.mainNavReqID = ev.RequestID
 	}
+	route := p.matchRouteLocked(ev.URL)
+	p.mu.Unlock()
+
+	if ev.IsIntercepted {
+		r := &Route{
+			page: p, RequestID: ev.RequestID, URL: ev.URL,
+			Method: ev.Method, Headers: headersToMap(ev.Headers),
+		}
+		// Run the handler off the event loop; default to continue when unmatched.
+		go func() {
+			if route != nil {
+				route.handler(r)
+				if !r.handled {
+					_ = r.Continue()
+				}
+			} else {
+				_ = r.Continue()
+			}
+		}()
+	}
+}
+
+func (p *Page) onResponseReceived(params json.RawMessage) {
+	var ev struct {
+		RequestID  string         `json:"requestId"`
+		Status     int            `json:"status"`
+		StatusText string         `json:"statusText"`
+		Headers    []headerKV     `json:"headers"`
+		RemoteIP   string         `json:"remoteIPAddress"`
+		FromCache  bool           `json:"fromCache"`
+	}
+	if err := json.Unmarshal(params, &ev); err != nil {
+		return
+	}
+	p.mu.Lock()
+	if ev.RequestID == p.mainNavReqID {
+		p.lastResponse = &Response{
+			URL:        p.url,
+			Status:     ev.Status,
+			StatusText: ev.StatusText,
+			Headers:    headersToMap(ev.Headers),
+			RemoteIP:   ev.RemoteIP,
+			FromCache:  ev.FromCache,
+		}
+	}
+	p.mu.Unlock()
+}
+
+func (p *Page) onRequestDone(params json.RawMessage) {
+	var ev struct {
+		RequestID string `json:"requestId"`
+	}
+	if err := json.Unmarshal(params, &ev); err != nil {
+		return
+	}
+	p.mu.Lock()
+	delete(p.inflight, ev.RequestID)
+	p.lastNetwork = time.Now()
 	p.mu.Unlock()
 }
 
