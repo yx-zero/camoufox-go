@@ -8,8 +8,14 @@ Pure-Go SDK for [Camoufox](https://github.com/daijro/camoufox) — the anti-dete
   undetectability, fingerprint spoofing, anti-graphical fingerprinting) lives in that binary and is
   driven by the `CAMOU_CONFIG` environment variables, exactly like the official Python library.
 - Drives the browser over Playwright's **Juggler** protocol (the protocol Camoufox is built for), so
-  the automation path — and its stealth — matches upstream. The only external dependency is
-  `golang.org/x/sys` (pure Go).
+  the automation path — and its stealth — matches upstream.
+- **Playwright-style driver**: locators & element handles, auto-waiting (`networkidle`/selector),
+  frames + bounding boxes, network interception, cookies/storage, dialogs, multiple browser contexts,
+  emulation, and page events — plus **headless Cloudflare Turnstile** clearance (`Humanize`).
+- **Launch options** ported from the Python library: proxy, GeoIP (timezone/locale/geolocation),
+  locale, WebGL, addons, fonts, resource blocking, persistent profiles, and more.
+- Dependencies are pure Go: `golang.org/x/sys`, plus `oschwald/maxminddb-golang` (used only for the
+  optional GeoIP feature). No cgo.
 
 ## Install
 
@@ -71,36 +77,105 @@ camoufox run -url https://bot.sannysoft.com/ -screenshot shot.png
 camoufox run -url https://example.com -os macos -headful
 ```
 
-## API
+## Launch options
 
 ```go
 br, err := camoufox.Launch(ctx, camoufox.Options{
-	Headless:       true,        // recommended; engine-patched to be undetectable
-	OS:             "windows",   // "windows" | "macos" | "linux" | "" (random)
-	Timezone:       "Europe/London",   // optional IANA tz override
-	Locale:         "en-GB",           // optional BCP-47 locale
-	WebRTCIP:       "203.0.113.7",     // optional WebRTC IPv4 spoof (set this when using a proxy)
-	FingerprintSeed: 0,                // non-zero => deterministic fingerprint
+	Headless:        true,            // recommended; engine-patched to be undetectable
+	OS:              "windows",       // "windows" | "macos" | "linux" | "" (random)
+	Humanize:        true,            // human-like cursor trajectories (needed for Turnstile)
+	FingerprintSeed: 0,               // non-zero => deterministic fingerprint
+	FFVersion:       0,               // override Firefox major version (0 = installed)
+
+	// Network / identity
+	Proxy:    &camoufox.Proxy{Server: "host:3128", Username: "u", Password: "p"},
+	GeoIP:    "auto",                 // spoof tz/locale/geolocation from the (proxy) IP; or an IP
+	Timezone: "Europe/London",        // explicit overrides (win over GeoIP)
+	Locale:   "en-GB,en",
+	WebRTCIP: "203.0.113.7",
+
+	// Profile / behavior
+	UserDataDir:   "./profile",       // persistent profile (cookies, cf_clearance, cache)
+	DisableCOOP:   true,              // allow clicking cross-origin iframes (Turnstile)
+	EnableCache:   true,
+	MainWorldEval: true,              // enable "mw:"-prefixed main-world evaluate
+
+	// Fingerprint knobs
+	ScreenMaxWidth: 1920, ScreenMaxHeight: 1080,
+	WindowWidth: 1280, WindowHeight: 800,
+	WebGLVendor: "Google Inc. (Intel)", WebGLRenderer: "ANGLE (Intel, ...)",
+	Fonts: []string{"Arial", "Segoe UI"}, CustomFontsOnly: false,
+
+	// Resource blocking
+	BlockImages: false, BlockWebRTC: false, BlockWebGL: false,
+
+	// Addons (default uBlock is opt-in)
+	DefaultAddons: false, Addons: []string{"/path/to/extracted/addon"},
+
+	// VirtualDisplay: "auto",        // Linux: spawn Xvfb automatically
 	// ExecutablePath, CacheDir, Args, Env, UserPrefs, Timeout, Debug, Fingerprint ...
 })
-
-pg, _ := br.NewPage(ctx)
-pg.Goto(ctx, url)
-val, _ := pg.Evaluate(ctx, expr)        // raw JSON result
-s,  _ := pg.EvaluateString(ctx, expr)   // string result
-pg.EvaluateInto(ctx, expr, &out)        // unmarshal into out
-html, _ := pg.Content(ctx)
-title, _ := pg.Title(ctx)
-png, _ := pg.Screenshot(ctx)            // PNG bytes
-cookies, _ := pg.Cookies(ctx)
-pg.Click(ctx, x, y)
-pg.Type(ctx, "text")                    // into the focused element
-pg.Close(ctx)
-br.Close()
+defer br.Close()
 ```
 
-The `fetch`, `fingerprint`, and `config` packages are usable on their own (binary management,
-fingerprint generation, and `CAMOU_CONFIG` encoding respectively).
+## Driver API
+
+```go
+pg, _ := br.NewPage(ctx)
+pg.Goto(ctx, url)
+pg.WaitForLoadState(ctx, camoufox.LoadStateNetworkIdle)
+resp := pg.Response()                            // resp.Status, resp.Headers
+
+// Evaluate
+val, _ := pg.Evaluate(ctx, expr)                 // raw JSON
+s,   _ := pg.EvaluateString(ctx, expr)
+pg.EvaluateInto(ctx, expr, &out)
+html, _ := pg.Content(ctx); title, _ := pg.Title(ctx)
+
+// Locators (auto-waiting, pierce open shadow roots)
+pg.Locator("#user").Fill(ctx, "alice")
+pg.Locator("button[type=submit]").Click(ctx)
+txt, _ := pg.Locator(".flash").InnerText(ctx)
+pg.WaitForSelector(ctx, "#ready", camoufox.WaitForSelectorOptions{Visible: true})
+
+// Input, waits, navigation
+pg.Click(ctx, x, y); pg.Type(ctx, "text"); pg.Press(ctx, "Enter"); pg.Wheel(ctx, x, y, 0, 400)
+pg.Reload(ctx); pg.GoBack(ctx); pg.SetContent(ctx, "<h1>hi</h1>")
+
+// Network interception
+pg.Route("*/ads/*", func(r *camoufox.Route) { r.Abort("blockedbyclient") })
+
+// Cookies & storage
+cs, _ := pg.Cookies(ctx); pg.SetCookies(ctx, cs); pg.ClearCookies(ctx)
+st, _ := pg.StorageState(ctx); pg.SetStorageState(ctx, st)
+
+// Events, emulation, screenshots
+pg.OnConsole(func(m camoufox.ConsoleMessage) { /* ... */ })
+pg.OnDialog(func(d *camoufox.Dialog) { d.Accept(ctx, "") })
+pg.SetViewportSize(ctx, 1280, 800); pg.SetColorScheme(ctx, "dark")
+full, _ := pg.ScreenshotFull(ctx); el, _ := pg.Locator("h1").Screenshot(ctx)
+
+// Isolated contexts (own cookies/cache; per-context proxy)
+c, _ := br.NewContext(ctx, camoufox.ContextOptions{Proxy: &camoufox.Proxy{Server: "host:3128"}})
+cp, _ := c.NewPage(ctx); defer c.Close(ctx)
+```
+
+### Clearing Cloudflare Turnstile (headless)
+
+```go
+br, _ := camoufox.Launch(ctx, camoufox.Options{Headless: true, OS: "windows", Humanize: true, DisableCOOP: true})
+pg, _ := br.NewPage(ctx)
+pg.Goto(ctx, "https://example-protected-site/")
+
+// The Turnstile iframe is cross-origin inside a closed shadow root — page JS can't
+// see it, but the Juggler frame tree can. Read its real geometry and click the box.
+f, _ := pg.WaitForFrameByURL(ctx, "challenges.cloudflare.com")
+box, _ := f.BoundingBox(ctx)
+pg.Click(ctx, box.X+30, box.Y+box.Height/2)      // Humanize makes the click pass
+```
+
+The `fetch`, `fingerprint`, `config`, `geoip`, `locale`, `webgl`, and `addons` packages are usable on
+their own.
 
 ## Verified stealth (Camoufox 135, headless, Windows)
 
@@ -133,14 +208,26 @@ Cross-compiles (`CGO_ENABLED=0`) to: `windows/amd64`, `windows/arm64`, `linux/am
    FD 3/4 on Unix; inherited HANDLEs via `PW_PIPE_READ`/`PW_PIPE_WRITE` on Windows.
 5. **`juggler/`** — pure-Go Juggler client (adapted from foxbridge): `\0`-framed JSON over the pipe,
    JSON-RPC with session routing, events.
-6. **`camoufox` (root)** — `Browser`/`Page` driver: targets, navigation lifecycle, evaluate, input,
-   screenshots, cookies.
+6. **`camoufox` (root)** — `Browser`/`Context`/`Page` driver: navigation lifecycle, evaluate, locators &
+   element handles, waits, frames, network interception, input, dialogs, emulation, events, cookies/
+   storage, and screenshots. Optional `geoip`/`locale`/`webgl`/`addons` packages back the launch options.
 
-## Limitations
+## Implemented / not yet
 
-MVP scope. Not yet implemented: network request interception/fulfillment, multi-frame/iframe helpers,
-downloads, workers, persistent contexts, and the BrowserForge synthetic-fingerprint generator (real
-presets are used instead). Contributions welcome.
+**Implemented:** fingerprint presets + per-launch noise, proxy, GeoIP (timezone/locale/geolocation via
+MaxMind), locale, WebGL sampling, addons, fonts, screen/window constraints, resource blocking, COOP
+toggle, cache, main-world eval, persistent profiles, virtual display (Xvfb), humanize; navigation +
+response, evaluate, waits (`load`/`domcontentloaded`/`networkidle`/selector/function/url), locators &
+element handles, frames + bounding boxes, network interception, `setExtraHTTPHeaders`, cookies + storage
+state + localStorage, init scripts, keyboard/mouse/wheel input, dialogs, multiple contexts (+ per-context
+proxy), emulation (viewport/geolocation/permissions/offline/color-scheme), page events
+(console/pageerror/popup), full-page + element screenshots, file upload, and headless Cloudflare
+Turnstile clearance.
+
+**Not yet:** BrowserForge synthetic-fingerprint generator (real presets are used instead), rich locators
+(`getByRole`/`getByText`/`.filter`/`.nth`), strict actionability auto-waits, downloads,
+`exposeFunction`, tracing/video/HAR, accessibility snapshots, cross-frame locators, and PDF output
+(Firefox/Juggler has no `printToPDF`). Contributions welcome.
 
 ## Credits
 
