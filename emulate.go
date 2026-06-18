@@ -35,12 +35,37 @@ func (p *Page) SetGeolocation(ctx context.Context, latitude, longitude, accuracy
 	return nil
 }
 
+// firefoxPermission maps web permission names to the Firefox/Juggler internal
+// names that Browser.grantPermissions expects (mirrors Playwright's mapping).
+var firefoxPermission = map[string]string{
+	"geolocation":   "geo",
+	"notifications":  "desktop-notification",
+	"push":           "desktop-notification",
+	"persistent-storage": "persistent-storage",
+	"camera":         "camera",
+	"microphone":     "microphone",
+	"background-sync": "background-sync",
+	"midi":           "midi",
+	"midi-sysex":     "midi-sysex",
+	"clipboard-read":  "clipboard-read",
+	"clipboard-write": "clipboard-write",
+}
+
 // GrantPermissions grants permissions (e.g. "geolocation", "notifications") to
-// an origin for the page's context.
+// an origin for the page's context. Web permission names are translated to the
+// Firefox internal names the browser expects.
 func (p *Page) GrantPermissions(ctx context.Context, origin string, permissions []string) error {
 	ctx, cancel := p.browser.opCtx(ctx)
 	defer cancel()
-	params := map[string]any{"origin": origin, "permissions": permissions}
+	mapped := make([]string, 0, len(permissions))
+	for _, perm := range permissions {
+		if ff, ok := firefoxPermission[perm]; ok {
+			mapped = append(mapped, ff)
+		} else {
+			mapped = append(mapped, perm)
+		}
+	}
+	params := map[string]any{"origin": origin, "permissions": mapped}
 	if p.contextID != "" {
 		params["browserContextId"] = p.contextID
 	}

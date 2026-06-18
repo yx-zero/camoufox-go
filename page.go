@@ -71,11 +71,15 @@ type frameInfo struct {
 }
 
 // navWaiter tracks a pending navigation's load lifecycle. A waiter is only
-// fulfilled by a load event after navigation has committed, so a stale load
-// from the pre-navigation document cannot satisfy it.
+// fulfilled by a load event after the TARGET navigation has committed. Camoufox
+// fires intermediate about:blank commits+loads before the real document; we
+// must not let those satisfy the waiter, or Goto returns while the page is still
+// about:blank. We gate on the navigate call's navigationId (and, until that id
+// is known, on the commit being to a non-about:blank URL).
 type navWaiter struct {
 	ch        chan error
 	committed bool
+	navID     string // navigationId returned by Page.navigate ("" until known)
 }
 
 func newPage(b *Browser, sessionID, targetID, contextID string) *Page {
@@ -95,6 +99,9 @@ func newPage(b *Browser, sessionID, targetID, contextID string) *Page {
 
 // SessionID returns the page's Juggler session id.
 func (p *Page) SessionID() string { return p.sessionID }
+
+// ContextID returns the page's browser-context id ("" for the default context).
+func (p *Page) ContextID() string { return p.contextID }
 
 // URL returns the last known committed URL of the main frame.
 func (p *Page) URL() string {
@@ -170,9 +177,10 @@ func (p *Page) onFrameDetached(params json.RawMessage) {
 
 func (p *Page) onNavigationCommitted(params json.RawMessage) {
 	var ev struct {
-		FrameID string `json:"frameId"`
-		URL     string `json:"url"`
-		Name    string `json:"name"`
+		FrameID      string `json:"frameId"`
+		URL          string `json:"url"`
+		Name         string `json:"name"`
+		NavigationID string `json:"navigationId"`
 	}
 	if err := json.Unmarshal(params, &ev); err != nil {
 		return
@@ -190,7 +198,16 @@ func (p *Page) onNavigationCommitted(params json.RawMessage) {
 		p.domContentLoaded = false
 		p.loadFired = false
 		for _, w := range p.navWaiters {
-			w.committed = true
+			switch {
+			case w.navID != "":
+				// We know the target navigation id: require an exact match.
+				if ev.NavigationID == w.navID {
+					w.committed = true
+				}
+			case ev.URL != "about:blank":
+				// Id not yet known: any real (non-blank) commit is the target.
+				w.committed = true
+			}
 		}
 	}
 	p.mu.Unlock()
@@ -390,12 +407,26 @@ func (p *Page) Goto(ctx context.Context, url string) error {
 	frameID := p.mainFrameID
 	p.mu.Unlock()
 
-	if _, err := p.client.Call(ctx, p.sessionID, "Page.navigate", map[string]any{
+	res, err := p.client.Call(ctx, p.sessionID, "Page.navigate", map[string]any{
 		"frameId": frameID,
 		"url":     url,
-	}); err != nil {
+	})
+	if err != nil {
 		p.removeNavWaiter(w)
 		return fmt.Errorf("camoufox: navigate %s: %w", url, err)
+	}
+	// Pin the waiter to this navigation's id so intermediate about:blank commits
+	// can't satisfy it. (If the real commit already arrived and set committed via
+	// the non-blank branch, this is harmless.)
+	var navRes struct {
+		NavigationID string `json:"navigationId"`
+	}
+	if json.Unmarshal(res, &navRes) == nil && navRes.NavigationID != "" {
+		p.mu.Lock()
+		if !w.committed {
+			w.navID = navRes.NavigationID
+		}
+		p.mu.Unlock()
 	}
 
 	select {

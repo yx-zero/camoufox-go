@@ -35,9 +35,10 @@ func (p *Page) OnPopup(handler func(*Page)) {
 
 func (p *Page) onConsole(params json.RawMessage) {
 	p.mu.Lock()
-	h := p.consoleHandler
+	consoleH := p.consoleHandler
+	errH := p.pageErrorHandler
 	p.mu.Unlock()
-	if h == nil {
+	if consoleH == nil && errH == nil {
 		return
 	}
 	var ev struct {
@@ -63,7 +64,15 @@ func (p *Page) onConsole(params json.RawMessage) {
 			parts = append(parts, a.Type)
 		}
 	}
-	h(ConsoleMessage{Type: ev.Type, Text: strings.Join(parts, " ")})
+	text := strings.Join(parts, " ")
+	if consoleH != nil {
+		consoleH(ConsoleMessage{Type: ev.Type, Text: text})
+	}
+	// In this Camoufox build uncaught page errors surface as console "error"
+	// entries rather than Page.uncaughtError, so bridge them to OnPageError.
+	if errH != nil && ev.Type == "error" {
+		errH(text)
+	}
 }
 
 func (p *Page) onUncaughtError(params json.RawMessage) {

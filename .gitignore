@@ -24,6 +24,7 @@ camoufox-bin
 /cmd/s2test/
 /cmd/feattest/
 /cmd/cfdebug/
+/cmd/livetest/
 
 # Go
 *.test
