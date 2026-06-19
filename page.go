@@ -343,18 +343,24 @@ func (p *Page) onRequestDone(params json.RawMessage) {
 
 func (p *Page) onNavigationAborted(params json.RawMessage) {
 	var ev struct {
-		FrameID   string `json:"frameId"`
-		ErrorText string `json:"errorText"`
+		FrameID      string `json:"frameId"`
+		NavigationID string `json:"navigationId"`
+		ErrorText    string `json:"errorText"`
 	}
 	if err := json.Unmarshal(params, &ev); err != nil {
 		return
 	}
 	p.mu.Lock()
 	if ev.FrameID == p.mainFrameID {
+		kept := p.navWaiters[:0]
 		for _, w := range p.navWaiters {
-			w.ch <- fmt.Errorf("navigation aborted: %s", ev.ErrorText)
+			if w.navID != "" && w.navID == ev.NavigationID {
+				w.ch <- fmt.Errorf("navigation aborted: %s", ev.ErrorText)
+			} else {
+				kept = append(kept, w)
+			}
 		}
-		p.navWaiters = nil
+		p.navWaiters = kept
 	}
 	p.mu.Unlock()
 }
